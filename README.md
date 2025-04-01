@@ -118,3 +118,44 @@ By looping through <b>all roles</b> (name represents each metadata filename like
 - <b>Root Cause:</b> Incomplete verification – Tough did not apply rollback checks uniformly to delegated target roles. This is a <b>partial implementation of a security control</b>, leaving a gap that attackers could exploit (CWE-352: Missing Crucial Step in Authorization; conceptually a subset of integrity verification issues). The code was only protecting top-level targets, assuming (incorrectly) that delegated roles wouldn’t regress.
 - <b>Impact:</b> An attacker able to manipulate the repository could hide updates or re-introduce old delegated target data without client detection. For instance, they could present an older delegated targets file signed with a now-compromised key, and because Tough didn’t check that file’s version, it would be accepted. In practice, this could result in clients <b>fetching outdated content</b> or missing critical revocations for delegated targets​. (see [here](https://github.com/advisories/GHSA-q6r9-r9pw-4cf7#:~:text=tough%20could%20fail%20to%20detect,targets%20that%20it%20should%20reject))
 - <b>Remediation:</b> Use tough <b>v0.20.0+</b>, which implements full snapshot rollback checking​. If maintaining a custom updater, ensure that for <b>every trusted metadata file</b> listed in a snapshot, the new snapshot also lists it with a version number >= the previous version. It’s also recommended to enable logging or auditing for any <b>delegated targets removals</b> in repository updates, as these should be rare and might indicate malicious activity if occurring unexpectedly.
+
+#### CVE-2025-2888: Improper Timestamp Metadata Caching on Rollback
+Tough incorrectly handled a detected rollback in the <b>Timestamp</b> role. The Timestamp role in TUF periodically signs the latest snapshot metadata version to help clients detect if they are seeing an older snapshot (a rollback). Tough did perform the rollback check on the snapshot version contained in the timestamp, but [only after caching the new timestamp metadata](https://github.com/advisories/GHSA-76g3-38jv-wxh4#:~:text=TUF%20repositories%20use%20the%20timestamp,timestamp%20metadata%20to%20its%20cache) locally.  If a rollback was detected, Tough would reject the update <b>but had already persisted the invalid timestamp as the “latest” in its cache</b>. This meant a malicious timestamp (with an outdated snapshot version) could poison the client’s cache. Subsequent legitimate updates could then appear to Tough as rollbacks (since the cache held a timestamp indicating a higher snapshot version than the new one), [blocking valid updates](https://github.com/advisories/GHSA-76g3-38jv-wxh4#:~:text=If%20the%20tough%20client%20successfully,client%20from%20consuming%20valid%20updates).
+
+- <b>Advisory:</b> [GitHub Security Advisory GHSA-76g3-38jv-wxh4 (CVE-2025-2888)](https://github.com/advisories/GHSA-76g3-38jv-wxh4)
+- <b>Affected Code:</b> The timestamp update logic in `tough/src/lib.rs` (function that loads the new `timestamp.json`). The core issue was an <b>order-of-operations bug</b>: Tough updated its local cache/state with the new Timestamp metadata before fully validating that the snapshot version inside wasn’t older than what it had seen before.
+
+<b>Vulnerable Implementation:</b> In Tough <0.20.0, when a new `timestamp.json` was fetched, the client would parse and write it to the cache (marking it as the current trusted timestamp) and then perform the rollback check on the snapshot version. If the snapshot version in the new timestamp was lower than the previously recorded snapshot version (indicating a rollback attempt), Tough would log an error and reject that update cycle – <b>but the cache already held the “bad” timestamp</b>. There was no removal of the cached entry in that error path. Thus, the client’s record of the “trusted” timestamp could become this outdated one.
+
+For example, suppose the last known snapshot version was 5. An attacker could provide a Timestamp metadata (with a higher timestamp version number) that signs snapshot version 4. Tough would accept the timestamp file (caching it), then notice snapshot 4 < 5 and error out of the update – but now its cache says “latest timestamp indicates snapshot 4”. When a correct timestamp (snapshot 5 or 6) comes next, Tough sees snapshot 5 vs cached snapshot 4 as another rollback (since it erroneously trusts the cache’s snapshot version 4 as baseline), and thus rejects even the valid update. The AWS bulletin describes this cycle: <i>“the client caches timestamp metadata despite it being correctly rejected when a rollback was detected… causing tough to subsequently fail to consume valid updates.”​</i>
+
+<b>Fixed Implementation:</b> The fix ensures that <b>rollback checks occur before caching</b> the new timestamp, and adds stricter validation of the timestamp contents. In Tough 0.20.0, the `load_timestamp()` function was modified to enforce that the Timestamp metadata is well-formed and that its snapshot version is not less than the previously trusted snapshot version before concluding the update. Specifically, the code now checks: (a) the timestamp metadata has exactly one entry (must only be for `snapshot.json`), (b) that entry exists and is parsed, and (c) the snapshot version inside is >= the older snapshot version. (see [here](https://github.com/awslabs/tough/commit/9b400e1c8b7d6b9ab8009104fa7fe5884db05f18#:~:text=)) Only after these validations pass is the new timestamp considered trusted. The critical added logic is illustrated below:
+
+```rust
+// Ensure the timestamp meta contains exactly one entry (the snapshot)
+ensure!(timestamp.signed.meta.len() == 1, error::TimestampMetaLengthSnafu { … });
+let snapshot_meta = timestamp.signed.meta.get("snapshot.json");
+ensure!(snapshot_meta.is_some(), error::MissingSnapshotMetaSnafu { … });
+
+// If we have a previously trusted timestamp (old_timestamp):
+if let Some(old_timestamp) = old_timestamp_opt {
+    // Check that the snapshot version in the new timestamp >= old snapshot version
+    let old_snapshot_meta = old_timestamp.signed.meta.get("snapshot.json").unwrap();
+    ensure!(
+        old_snapshot_meta.version <= snapshot_meta.unwrap().version,
+        error::OlderSnapshotInTimestampSnafu {
+            // details: new snapshot vs old snapshot versions
+            snapshot_new: snapshot_meta.unwrap().version,
+            snapshot_old: old_snapshot_meta.version,
+            timestamp_new: timestamp.signed.version,
+            timestamp_old: old_timestamp.signed.version
+        }
+    );
+}
+```
+
+With this change, if the new timestamp’s snapshot version is lower than the previously seen snapshot version, the `ensure!` will fail <b>before</b> the new timestamp is saved as trusted. The error `OlderSnapshotInTimestamp` is raised to abort the update. As a result, Tough will keep the old (correct) timestamp in cache when a rollback is detected, and the bad timestamp is never cached as trusted. This prevents the scenario where a rejected timestamp update pollutes future updates.
+
+- <b>Root Cause:</b> An <b>improper update sequence</b> (CWE-367: Time-of-check Time-of-use Race Condition, in the context of metadata validation). Tough’s check for snapshot rollback in the timestamp was done at the wrong time, after side effects (caching) had occurred. Additionally, not fully validating timestamp contents (length) made the logic brittle​
+- <b>Impact:</b> A malicious timestamp (with a lower snapshot version) could temporarily trick the client, causing it to store bad state. This leads to a denial of service in update mechanism: the client would thereafter treat genuine updates as invalid (false rollback detection)​. No direct code execution or data theft, but <b>persistent update</b> failure can be just as dangerous (e.g., preventing security patches from applying). (see [here](https://github.com/advisories/GHSA-76g3-38jv-wxh4#:~:text=If%20the%20tough%20client%20successfully,client%20from%20consuming%20valid%20updates))
+- <b>Remediation:</b> Upgrade to tough <b>0.20.0+</b> The patched version handles timestamp rollback events safely. If an update failure due to this bug was observed, it may be necessary to <b>clear the cached metadata</b> (to remove any poisoned timestamp) before retrying updates with the fixed client. As a general practice, clients should always verify metadata before trusting or caching it – this issue underscores that principle.
