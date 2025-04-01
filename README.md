@@ -75,3 +75,46 @@ Additionally, the recursive `find_target` calls now carry a `terminated` flag to
 - <b>Root Cause:</b> A logical flaw where the code did not implement the terminating delegation semantics (CWE-284: Improper Access Control – lower-priority roles could override intended restrictions)​. Essentially, the absence of a `break` on a terminating delegation allowed unauthorized target data to be considered.
 - <b>Impact:</b> Clients could fetch targets owned by the wrong role – specifically, if a project delegated a subset of targets to another party (and marked that delegation as terminating to limit override scope), that party could still serve arbitrary content for targets outside its scope. This breaks trust hierarchies in a TUF repository.
 - <b>Remediation:</b> Update to tough <b>0.20.0+</b> which correctly implements terminating delegation handling. If you maintain a fork or custom client, ensure that your target lookup halts on terminating delegations. Security testers should attempt delegation abuse scenarios only on older versions; the patched version will correctly ignore malicious lower-priority responses.
+
+#### CVE-2025-2887: Incomplete Rollback Detection for Delegated Targets
+Tough’s logic for detecting <b>rollback attacks in snapshot metadata</b> was incomplete. Specifically, when updating the Snapshot role, Tough should verify that <b>all previously seen targets metadata (including delegated targets) are still present and not versioned backwards in the new snapshot</b>. (see [here](https://github.com/advisories/GHSA-q6r9-r9pw-4cf7#:~:text=When%20updating%20the%20snapshot%20role%2C,check%20for%20delegated%20targets%20files)) Tough did enforce this for the top-level `targets.json`, but <b>failed to do so for delegated target metadata files</b>. This gap could allow an attacker to remove or revert a delegated target file in the repository’s snapshot metadata without detection, [causing the client to accept an outdated (or missing) delegated target file as if it were up-to-date](https://github.com/advisories/GHSA-q6r9-r9pw-4cf7#:~:text=tough%20could%20fail%20to%20detect,targets%20that%20it%20should%20reject)​.
+
+- <b>Advisory:</b> [GitHub Security Advisory GHSA-q6r9-r9pw-4cf7 (CVE-2025-2887)](https://github.com/advisories/GHSA-q6r9-r9pw-4cf7)
+- <b>Affected Code:</b> The snapshot update verification in `tough/src/lib.rs` (function that loads/applies new Snapshot metadata). The vulnerable code only checked the continuity of the main `targets.json` role in the snapshot, but <b>did not iterate over delegated roles</b> listed in snapshot metadata to perform similar checks.
+
+<b>Vulnerable Implementation:</b> In Tough <0.20.0, after retrieving a new `snapshot.json`, the client would ensure that the root and snapshot roles were not rolled back, and it would specifically ensure that `targets.json` was still present. It also verified that the version of `targets.json` in the new snapshot was >= the previous version. However, <b>if the snapshot contained delegated targets (e.g., `projects.json`, `user.json` delegated metadata)</b>, the client did not verify those. For example, originally the code did something like:
+
+```rust
+// Pseudo-code of original snapshot rollback check (simplified)
+if let Some(old_targets_meta) = old_snapshot.meta.get("targets.json") {
+    let new_targets_meta = new_snapshot.meta.get("targets.json").unwrap();
+    ensure!(new_targets_meta.version >= old_targets_meta.version, ...);
+}
+// (No checks for delegated target roles like "projects.json", "user.json", etc.)
+```
+
+This means if an attacker with repository access <b>removed a delegated metadata file or rolled it back to an older version</b>, Tough’s client would not notice – as long as the primary targets.json was intact. The client could then download an outdated target from that delegation, unaware that it should have been rejected as a rollback.
+
+<b>Fixed Implementation:</b> Version 0.20.0 adds comprehensive checks for <b>every role listed in the snapshot metadata</b>. The new code iterates through each entry in the old snapshot’s metadata (including all delegated targets roles) and ensures two things for each: (1) that the role still exists in the new snapshot, and (2) its version has not decreased. If any role is missing in the new snapshot or has a lower version number than before, the update is rejected as a potential rollback attack​. For example:
+
+```rust
+for (name, old_meta) in &old_snapshot.signed.meta {
+    // 1. Role must appear in new snapshot
+    ensure!(
+        snapshot.signed.meta.contains_key(name),
+        error::SnapshotRoleMissingSnafu { role: name, old_version: old_snapshot.signed.version, new_version: snapshot.signed.version }
+    );
+    // 2. Role’s version must not decrease
+    let new_meta = snapshot.signed.meta.get(name).unwrap();
+    ensure!(
+        old_meta.version <= new_meta.version,
+        error::SnapshotRoleRollbackSnafu { role: name, old_role_version: old_meta.version, new_role_version: new_meta.version, … }
+    );
+}
+```
+
+By looping through <b>all roles</b> (name represents each metadata filename like `targets.json`, `delegated-role.json`, etc.), the client will catch if any delegated target metadata was removed or reverted. The errors `SnapshotRoleMissing` and `SnapshotRoleRollback` will trigger [if a role disappeared or its version went backwards](https://github.com/awslabs/tough/commit/3345151a87c358d1ce43aeb7e8b3ebea5ebdbab4). Notably, Tough now also explicitly ensures that the snapshot contains at least the `targets.json` entry (otherwise it errors with `SnapshotTargetsMetaMissing`) as a sanity check​.
+
+- <b>Root Cause:</b> Incomplete verification – Tough did not apply rollback checks uniformly to delegated target roles. This is a <b>partial implementation of a security control</b>, leaving a gap that attackers could exploit (CWE-352: Missing Crucial Step in Authorization; conceptually a subset of integrity verification issues). The code was only protecting top-level targets, assuming (incorrectly) that delegated roles wouldn’t regress.
+- <b>Impact:</b> An attacker able to manipulate the repository could hide updates or re-introduce old delegated target data without client detection. For instance, they could present an older delegated targets file signed with a now-compromised key, and because Tough didn’t check that file’s version, it would be accepted. In practice, this could result in clients <b>fetching outdated content</b> or missing critical revocations for delegated targets​. (see [here](https://github.com/advisories/GHSA-q6r9-r9pw-4cf7#:~:text=tough%20could%20fail%20to%20detect,targets%20that%20it%20should%20reject))
+- <b>Remediation:</b> Use tough <b>v0.20.0+</b>, which implements full snapshot rollback checking​. If maintaining a custom updater, ensure that for <b>every trusted metadata file</b> listed in a snapshot, the new snapshot also lists it with a version number >= the previous version. It’s also recommended to enable logging or auditing for any <b>delegated targets removals</b> in repository updates, as these should be rare and might indicate malicious activity if occurring unexpectedly.
