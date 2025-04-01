@@ -159,3 +159,15 @@ With this change, if the new timestamp’s snapshot version is lower than the pr
 - <b>Root Cause:</b> An <b>improper update sequence</b> (CWE-367: Time-of-check Time-of-use Race Condition, in the context of metadata validation). Tough’s check for snapshot rollback in the timestamp was done at the wrong time, after side effects (caching) had occurred. Additionally, not fully validating timestamp contents (length) made the logic brittle​
 - <b>Impact:</b> A malicious timestamp (with a lower snapshot version) could temporarily trick the client, causing it to store bad state. This leads to a denial of service in update mechanism: the client would thereafter treat genuine updates as invalid (false rollback detection)​. No direct code execution or data theft, but <b>persistent update</b> failure can be just as dangerous (e.g., preventing security patches from applying). (see [here](https://github.com/advisories/GHSA-76g3-38jv-wxh4#:~:text=If%20the%20tough%20client%20successfully,client%20from%20consuming%20valid%20updates))
 - <b>Remediation:</b> Upgrade to tough <b>0.20.0+</b> The patched version handles timestamp rollback events safely. If an update failure due to this bug was observed, it may be necessary to <b>clear the cached metadata</b> (to remove any poisoned timestamp) before retrying updates with the fixed client. As a general practice, clients should always verify metadata before trusting or caching it – this issue underscores that principle.
+
+References:
+- [AWS Security Bulletin AWS-2025-007](https://aws.amazon.com/security/security-bulletins/AWS-2025-007/) – <i>Issue with tough, versions prior to 0.20.0 (Multiple CVEs)​</i>
+- [GitHub Advisory Database entries for CVE-2025-2885](https://github.com/advisories/GHSA-5vmp-m5v2-hx47)
+- [GitHub Advisory Database entries for CVE-2025-2886](https://github.com/advisories/GHSA-v4wr-j3w6-mxqc)
+- [GitHub Advisory Database entries for CVE-2025-2887](https://github.com/advisories/GHSA-q6r9-r9pw-4cf7)
+- [GitHub Advisory Database entries for CVE-2025-2888](https://github.com/advisories/GHSA-76g3-38jv-wxh4)
+- Tough v0.20.0 Patch Commits:
+    - Root version fix commit | [`awslabs/tough@​0eeb60a`](https://github.com/awslabs/tough/commit/0eeb60aefe27f00b65730634b788a1aafb8bf3c6)
+    - Terminating delegations fix​ commit | [`awslabs/tough@598111f`](https://github.com/awslabs/tough/commit/598111f88105a707ee68b0fa06c52da7176ea96a)
+    - Snapshot rollback fix commit | [`awslabs/tough@3345151`](https://github.com/awslabs/tough/commit/3345151a87c358d1ce43aeb7e8b3ebea5ebdbab4)
+    - Timestamp rollback fix​ commit | [`awslabs/tough@9b400e1`](https://github.com/awslabs/tough/commit/9b400e1c8b7d6b9ab8009104fa7fe5884db05f18)
